@@ -1,0 +1,12 @@
+/api/v1/auth
+/api/v1/farms
+/api/v1/zones
+/api/v1/esp32-devices
+/api/v1/sensors
+/api/v1/actuators
+/api/v1/telemetry
+/api/v1/alerts
+/api/v1/automation-rules
+/api/v1/schedules
+/api/v1/reports
+/api/v1/ai

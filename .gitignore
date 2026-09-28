@@ -1,0 +1,74 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Visual Studio Code
+.vscode/
+*.code-workspace
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+secrets/
+credentials/
+
+# Logs
+*.log
+logs/
+storage/logs/
+
+# Backups and temporary files
+backups/
+tmp/
+temp/
+*.bak
+*.backup
+*.sql.gz
+
+# PHP / Composer
+backend/vendor/
+backend/.phpunit.result.cache
+
+# Flutter / Dart
+flutter_app/.dart_tool/
+flutter_app/.packages
+flutter_app/.flutter-plugins
+flutter_app/.flutter-plugins-dependencies
+flutter_app/.metadata
+flutter_app/build/
+flutter_app/.idea/
+flutter_app/android/.gradle/
+flutter_app/android/app/debug/
+flutter_app/android/app/profile/
+flutter_app/android/app/release/
+flutter_app/ios/Pods/
+flutter_app/ios/.symlinks/
+flutter_app/macos/Pods/
+flutter_app/linux/flutter/ephemeral/
+flutter_app/windows/flutter/ephemeral/
+
+# Python / AI
+ai/.venv/
+ai/venv/
+ai/__pycache__/
+ai/**/*.pyc
+ai/.pytest_cache/
+ai/models/*.pkl
+ai/models/*.joblib
+ai/models/*.onnx
+ai/data/raw/
+ai/data/private/
+
+# ESP32 / Arduino build files
+esp32/.pio/
+esp32/build/
+esp32/.vscode/
+
+# Test reports
+coverage/
+test-results/
