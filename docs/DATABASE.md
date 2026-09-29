@@ -2,46 +2,77 @@
 
 ## Database Engine
 
-MariaDB runs on the Raspberry Pi Local Server.
+- Engine: MariaDB
+- Database Name: `smartfarm`
+- Character Set: `utf8mb4`
+- Collation: `utf8mb4_unicode_ci`
+- Storage Engine: InnoDB
+- Timestamp Policy: Store application timestamps in UTC using `DATETIME(3)`
+
+## Design Principles
+
+- Local-first database hosted on Raspberry Pi.
+- Relational schema with primary keys and foreign keys.
+- Current state is separated from historical telemetry.
+- Sensor and actuator definitions are dynamic.
+- Every schema change uses a new SQL migration.
+- Credentials and secrets are stored outside Git.
+- Application database user has only required privileges.
 
 ## Main Domains
 
-| Domain | Main Tables |
+| Domain | Tables |
 |---|---|
-| Identity | users, roles, user_roles |
-| Farm Structure | farms, zones |
-| IoT Devices | esp32_devices, sensors, actuators |
-| Telemetry | sensor_readings, weather_data, soil_data |
-| Device Control | device_states, device_commands |
-| Automation | automation_rules, schedules |
-| Alerts | alerts, notifications |
-| Intelligence | crops, crop_profiles, ai_analysis |
-| Audit and Logs | audit_logs, system_logs, mqtt_messages |
+| Migration | `schema_migrations` |
+| User and Access | `users`, `roles`, `user_roles` |
+| Farm Structure | `farms`, `zones` |
+| ESP32 | `esp32_devices`, `firmware_versions` |
+| Sensor | `sensor_types`, `sensors`, `sensor_readings` |
+| Actuator | `actuator_types`, `actuators`, `device_states`, `device_state_history`, `device_commands` |
+| Automation | `automation_rules`, `schedules` |
+| Crop | `crops`, `crop_profiles`, `zone_crops` |
+| Environment | `weather_data`, `soil_data` |
+| Alert | `alerts`, `notifications` |
+| AI | `ai_analysis` |
+| Dashboard | `dashboard_layouts`, `dashboard_widgets` |
+| Logging | `mqtt_messages`, `system_logs`, `audit_logs` |
 
-## Data Policy
+## Current State and Historical Data
 
-- Store timestamps in UTC.
-- Separate current state from historical data.
-- Index high-volume telemetry by sensor ID and recorded timestamp.
-- Use migrations for every schema change.
-- Never store plaintext passwords.
-EOF
+| Data Type | Current Data Table | Historical Data Table |
+|---|---|---|
+| Actuator State | `device_states` | `device_state_history` |
+| Sensor Value | Latest record queried from `sensor_readings` initially | `sensor_readings` |
+| ESP32 Status | `esp32_devices` | `mqtt_messages`, `system_logs` |
+| Command | Latest status in `device_commands` | `device_commands`, `audit_logs` |
 
-cat > docs/MQTT.md <<'EOF'
-# MQTT Design
+## Telemetry Retention Strategy
 
-## MQTT Broker
+Initial implementation stores raw readings in `sensor_readings`.
 
-Mosquitto on Raspberry Pi is the local MQTT Broker.
+Future optimization:
 
-## Topic Pattern
+1. Retain detailed raw telemetry for a configurable period.
+2. Create hourly and daily aggregation tables for reporting.
+3. Archive or delete expired raw data according to retention policy.
+4. Review indexes and database size monthly.
+5. Consider time-based table partitioning only after real volume justifies it.
 
-```text
-farm/{farm_id}/esp32/{esp32_id}/status
-farm/{farm_id}/esp32/{esp32_id}/telemetry
-farm/{farm_id}/zone/{zone_id}/sensor/{sensor_id}/reading
-farm/{farm_id}/zone/{zone_id}/actuator/{actuator_id}/command
-farm/{farm_id}/zone/{zone_id}/actuator/{actuator_id}/ack
-farm/{farm_id}/zone/{zone_id}/actuator/{actuator_id}/state
-farm/{farm_id}/alert/{alert_id}
-farm/{farm_id}/system/status
+## Migration Rules
+
+1. Never modify a migration already applied to production.
+2. Create the next ordered migration file instead.
+3. Test every migration on a non-production database first.
+4. Take a database backup before structural changes.
+5. Record the migration in `schema_migrations`.
+6. Keep migrations in Git.
+
+## Security Rules
+
+- Do not use MariaDB root account from the application.
+- Use prepared statements in PHP.
+- Do not store plaintext passwords.
+- Restrict database user to `localhost`.
+- Do not expose port `3306` to the network unless a future justified requirement exists.
+- Store database credentials in `/etc/smartfarm/database.env`.
+- Do not commit `.env` or server credential files into Git.
