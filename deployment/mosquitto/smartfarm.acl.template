@@ -1,0 +1,18 @@
+# SMART FARM MQTT ACL Template
+#
+# This file contains no password.
+# Provision a separate MQTT username and an ACL block for every ESP32.
+
+# Backend MQTT service
+user smartfarm_backend
+topic readwrite farm/#
+
+# ESP32 example:
+# Replace ESP32_DEVICE_CODE, FARM_CODE, and ZONE_CODE before deployment.
+user ESP32_DEVICE_CODE
+topic write farm/FARM_CODE/esp32/ESP32_DEVICE_CODE/status
+topic write farm/FARM_CODE/esp32/ESP32_DEVICE_CODE/telemetry
+topic write farm/FARM_CODE/zone/ZONE_CODE/sensor/+/reading
+topic write farm/FARM_CODE/zone/ZONE_CODE/actuator/+/state
+topic write farm/FARM_CODE/zone/ZONE_CODE/actuator/+/ack
+topic read farm/FARM_CODE/zone/ZONE_CODE/actuator/+/command
