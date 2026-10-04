@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import 'soil_test_screen.dart';
+
 import '../services/api_service.dart';
 import '../services/sse_service.dart';
 
@@ -19,6 +21,7 @@ class _DashboardViewState extends State<DashboardView> {
 
   /// Zone ที่โหลดมาจาก API จริง
   List<dynamic> _zones = [];
+  Map<int, dynamic> _latestSoilTestByZone = {};
 
   /// null = All Zones
   /// ตัวเลข = id ของ Zone ที่เลือก
@@ -113,6 +116,8 @@ class _DashboardViewState extends State<DashboardView> {
         /// null = All Zones
         _selectedZoneId = null;
       });
+
+      await _loadLatestSoilTests();
     } catch (e) {
       if (!mounted) {
         return;
@@ -123,6 +128,32 @@ class _DashboardViewState extends State<DashboardView> {
         _zonesError = e.toString();
       });
     }
+  }
+
+  Future<void> _loadLatestSoilTests() async {
+    final Map<int, dynamic> latestByZone = {};
+
+    for (final zone in _zones) {
+      final int? zoneId = int.tryParse(zone['id'].toString());
+      if (zoneId == null) continue;
+
+      try {
+        final List<dynamic> history =
+            await ApiService.getSoilTestHistory(zoneId);
+
+        if (history.isNotEmpty) {
+          latestByZone[zoneId] = history.first;
+        }
+      } catch (_) {
+        // Keep dashboard usable if soil-test history is unavailable.
+      }
+    }
+
+    if (!mounted) return;
+
+    setState(() {
+      _latestSoilTestByZone = latestByZone;
+    });
   }
 
   // ============================================================
@@ -366,6 +397,18 @@ class _DashboardViewState extends State<DashboardView> {
               _connectSse();
             },
             icon: const Icon(Icons.refresh),
+          ),
+          IconButton(
+            tooltip: 'Soil Test',
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => const SoilTestScreen(),
+                ),
+              );
+            },
+            icon: const Icon(Icons.science),
           ),
           IconButton(
             tooltip: 'Settings',
@@ -743,6 +786,24 @@ class _DashboardViewState extends State<DashboardView> {
 
     final double? soilMoisture = _getSensorValue('soil_moisture_01');
 
+    final dynamic latestSoilTest = _selectedZoneId != null
+        ? _latestSoilTestByZone[_selectedZoneId]
+        : (_latestSoilTestByZone.values.isNotEmpty
+            ? _latestSoilTestByZone.values.reduce((a, b) {
+                final DateTime dateA =
+                    DateTime.tryParse(
+                          a['measured_at']?.toString() ?? '',
+                        ) ??
+                        DateTime.fromMillisecondsSinceEpoch(0);
+                final DateTime dateB =
+                    DateTime.tryParse(
+                          b['measured_at']?.toString() ?? '',
+                        ) ??
+                        DateTime.fromMillisecondsSinceEpoch(0);
+                return dateA.isAfter(dateB) ? a : b;
+              })
+            : null);
+
     final List<Widget> cards = [
       // --------------------------------------------------------
       // REAL-TIME TEMPERATURE
@@ -792,29 +853,29 @@ class _DashboardViewState extends State<DashboardView> {
       ),
 
       // --------------------------------------------------------
-      // pH
-      // --------------------------------------------------------
-      // ยังไม่มี SSE sensor mapping ที่ยืนยันแล้ว
+      // pH — LATEST SOIL TEST
       // --------------------------------------------------------
       _buildSensorCard(
         title: 'pH',
-        value: '--',
+        value: latestSoilTest?['ph']?.toString() ?? '--',
         unit: '',
         icon: Icons.science,
-        status: 'Pending',
+        status: latestSoilTest != null ? 'Latest' : 'Pending',
       ),
 
       // --------------------------------------------------------
-      // NPK
-      // --------------------------------------------------------
-      // ยังไม่มี SSE sensor mapping ที่ยืนยันแล้ว
+      // NPK — LATEST SOIL TEST
       // --------------------------------------------------------
       _buildSensorCard(
         title: 'NPK',
-        value: '--',
-        unit: 'ppm',
+        value: latestSoilTest != null
+            ? 'N ${latestSoilTest['nitrogen'] ?? '-'} | '
+                'P ${latestSoilTest['phosphorus'] ?? '-'} | '
+                'K ${latestSoilTest['potassium'] ?? '-'}'
+            : '--',
+        unit: 'mg/kg',
         icon: Icons.eco,
-        status: 'Pending',
+        status: latestSoilTest != null ? 'Latest' : 'Pending',
       ),
 
       // --------------------------------------------------------
