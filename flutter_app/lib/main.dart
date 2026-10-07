@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'views/welcome_view.dart'; // เรียกหน้า Welcome
+import 'views/welcome_view.dart';
 
 void main() {
   runApp(const SmartFarmApp());
@@ -18,7 +18,7 @@ class SmartFarmApp extends StatelessWidget {
         scaffoldBackgroundColor: Colors.grey.shade100,
         fontFamily: 'Roboto', // หรือฟอนต์หลักของคุณ
       ),
-      home: const WelcomeView(), // เริ่มต้นที่หน้าโลโก้ต้อนรับ
+      home: const WelcomeView(),
     );
   }
 }

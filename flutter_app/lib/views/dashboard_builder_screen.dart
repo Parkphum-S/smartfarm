@@ -1,11 +1,22 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
 import 'soil_test_screen.dart';
-
+import 'actuator_history_screen.dart';
+import 'zone_management_screen.dart';
+import 'profile_screen.dart';
+import 'device_sensor_management_screen.dart';
 import '../services/api_service.dart';
 import '../services/sse_service.dart';
+
+class AiSafetyResult {
+  final bool allowed;
+  final String reason;
+
+  const AiSafetyResult({required this.allowed, required this.reason});
+}
 
 class DashboardView extends StatefulWidget {
   const DashboardView({super.key});
@@ -30,6 +41,33 @@ class _DashboardViewState extends State<DashboardView> {
   /// สถานะการโหลด Zone
   bool _zonesLoading = true;
 
+  /// Actuator ที่โหลดจาก API จริง
+  List<dynamic> _actuators = [];
+
+  /// Sensor ที่โหลดจาก API จริง
+  List<dynamic> _sensors = [];
+
+  /// สถานะการโหลด Sensor
+  bool _sensorsLoading = true;
+
+  /// สถานะการโหลด Actuator
+  bool _actuatorsLoading = true;
+
+  /// Error จาก Actuator API
+  String? _actuatorsError;
+
+  /// สถานะของ Water Pump
+  bool _waterPumpOn = false;
+
+  /// ป้องกันการกดซ้ำระหว่างส่งคำสั่ง Water Pump
+  bool _waterPumpCommandLoading = false;
+
+  /// สถานะของ Water Pump Out
+  bool _waterPumpOutOn = false;
+
+  /// ป้องกันการกดซ้ำระหว่างส่งคำสั่ง Water Pump Out
+  bool _waterPumpOutCommandLoading = false;
+
   /// Error จาก Zone API
   String? _zonesError;
 
@@ -39,20 +77,13 @@ class _DashboardViewState extends State<DashboardView> {
 
   /// เก็บค่าตามโครงสร้าง:
   ///
-  /// zone_id
-  ///   └── sensor_code
-  ///         └── value
-  ///
-  /// ตัวอย่าง:
-  ///
   /// {
-  ///   1: {
-  ///     'temperature_01': 22.6,
-  ///     'humidity_01': 44.0,
-  ///     'soil_moisture_01': 24.0,
+  ///   zone_id: {
+  ///     'sensor_code': value,
   ///   }
   /// }
   final Map<int, Map<String, double>> _sensorValuesByZone = {};
+  final Map<int, Map<String, String>> _sensorQualityByZone = {};
 
   // ============================================================
   // SSE CONNECTION STATE
@@ -63,6 +94,12 @@ class _DashboardViewState extends State<DashboardView> {
 
   /// เก็บ subscription เพื่อยกเลิกเมื่อออกจากหน้า
   StreamSubscription<Map<String, dynamic>>? _sseSubscription;
+
+  /// Timer สำหรับ reconnect SSE
+  Timer? _sseReconnectTimer;
+
+  /// จำนวนครั้งที่พยายาม reconnect SSE
+  int _sseReconnectAttempt = 0;
 
   /// เวลาที่ได้รับ Sensor data ล่าสุด
   DateTime? _lastUpdate;
@@ -78,6 +115,11 @@ class _DashboardViewState extends State<DashboardView> {
     /// โหลด Zone จาก API
     _loadZones();
 
+    _loadSensors();
+
+    /// โหลด Actuator และสถานะจริงจาก API
+    _loadActuators();
+
     /// เชื่อมต่อ SSE
     _connectSse();
   }
@@ -87,7 +129,187 @@ class _DashboardViewState extends State<DashboardView> {
     _sseSubscription?.cancel();
     _sseSubscription = null;
 
+    _sseReconnectTimer?.cancel();
+    _sseReconnectTimer = null;
+
     super.dispose();
+  }
+
+  // ============================================================
+  // ZONE ACTUATOR MAPPING
+  // ============================================================
+
+  String? _getSelectedZoneCode() {
+    final int? zoneId = _selectedZoneId;
+
+    if (zoneId == null) {
+      return null;
+    }
+
+    for (final dynamic zone in _zones) {
+      if (_getZoneId(zone) == zoneId) {
+        final String code = zone['code']?.toString() ?? '';
+        return code.isNotEmpty ? code : null;
+      }
+    }
+
+    return null;
+  }
+
+  String? _getZoneActuatorCode({
+    required String actuatorType,
+  }) {
+    final int? zoneId = _selectedZoneId;
+
+    if (zoneId == null) {
+      return null;
+    }
+
+    for (final dynamic actuator in _actuators) {
+      final int? actuatorZoneId =
+          int.tryParse(actuator['zone_id']?.toString() ?? '');
+
+      if (actuatorZoneId != zoneId) {
+        continue;
+      }
+
+      final String code =
+          actuator['actuator_code']?.toString() ?? '';
+
+      if (actuatorType == 'water_pump_in' &&
+          code == 'water_pump_in_001') {
+        return code;
+      }
+
+      if (actuatorType == 'water_pump_out' &&
+          code == 'water_pump_out_001') {
+        return code;
+      }
+
+      if (zoneId == 1 && actuatorType == 'water_pump_in' &&
+          code == 'water_pump_01') {
+        return code;
+      }
+
+      if (zoneId == 1 && actuatorType == 'water_pump_out' &&
+          code == 'oxygen_pump_01') {
+        return code;
+      }
+    }
+
+    return null;
+  }
+
+  // ============================================================
+  // REAL WATER PUMP CONTROL
+  // ============================================================
+
+  Future<void> _setWaterPump(bool value) async {
+    if (_waterPumpCommandLoading) {
+      return;
+    }
+
+    final String? zoneCode = _getSelectedZoneCode();
+    final String? actuatorCode = _getZoneActuatorCode(
+      actuatorType: 'water_pump_in',
+    );
+
+    if (zoneCode == null || actuatorCode == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Water Pump In: Actuator unavailable for selected zone'),
+        ),
+      );
+      return;
+    }
+
+    setState(() {
+      _waterPumpCommandLoading = true;
+    });
+
+    final bool success = await ApiService.sendActuatorCommand(
+      actuatorId: actuatorCode,
+      action: value ? 'on' : 'off',
+      zoneId: zoneCode,
+    );
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _waterPumpCommandLoading = false;
+
+      if (success) {
+        _waterPumpOn = value;
+      }
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          success
+              ? 'Water Pump In ${value ? "ON" : "OFF"} command sent'
+              : 'Water Pump In command failed',
+        ),
+      ),
+    );
+  }
+
+  // ============================================================
+  // REAL WATER PUMP OUT CONTROL
+  // ============================================================
+
+  Future<void> _setWaterPumpOut(bool value) async {
+    if (_waterPumpOutCommandLoading) {
+      return;
+    }
+
+    final String? zoneCode = _getSelectedZoneCode();
+    final String? actuatorCode = _getZoneActuatorCode(
+      actuatorType: 'water_pump_out',
+    );
+
+    if (zoneCode == null || actuatorCode == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Water Pump Out: Actuator unavailable for selected zone'),
+        ),
+      );
+      return;
+    }
+
+    setState(() {
+      _waterPumpOutCommandLoading = true;
+    });
+
+    final bool success = await ApiService.sendActuatorCommand(
+      actuatorId: actuatorCode,
+      action: value ? 'on' : 'off',
+      zoneId: zoneCode,
+    );
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _waterPumpOutCommandLoading = false;
+
+      if (success) {
+        _waterPumpOutOn = value;
+      }
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          success
+              ? 'Water Pump Out ${value ? "ON" : "OFF"} command sent'
+              : 'Water Pump Out command failed',
+        ),
+      ),
+    );
   }
 
   // ============================================================
@@ -130,30 +352,92 @@ class _DashboardViewState extends State<DashboardView> {
     }
   }
 
-  Future<void> _loadLatestSoilTests() async {
-    final Map<int, dynamic> latestByZone = {};
+  // ============================================================
+  // LOAD ACTUATORS FROM API
+  // ============================================================
 
-    for (final zone in _zones) {
-      final int? zoneId = int.tryParse(zone['id'].toString());
-      if (zoneId == null) continue;
-
-      try {
-        final List<dynamic> history =
-            await ApiService.getSoilTestHistory(zoneId);
-
-        if (history.isNotEmpty) {
-          latestByZone[zoneId] = history.first;
-        }
-      } catch (_) {
-        // Keep dashboard usable if soil-test history is unavailable.
+  Future<void> _loadSensors() async {
+    try {
+      if (mounted) {
+        setState(() {
+          _sensorsLoading = true;
+        });
       }
+
+      final List<dynamic> sensors = await ApiService.getSensors();
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _sensors = sensors;
+        _sensorsLoading = false;
+      });
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _sensors = [];
+        _sensorsLoading = false;
+      });
     }
+  }
 
-    if (!mounted) return;
+  Future<void> _loadActuators() async {
+    try {
+      if (mounted) {
+        setState(() {
+          _actuatorsLoading = true;
+          _actuatorsError = null;
+        });
+      }
 
-    setState(() {
-      _latestSoilTestByZone = latestByZone;
-    });
+      final List<dynamic> actuators = await ApiService.getActuators();
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _actuators = actuators;
+        _actuatorsLoading = false;
+
+        for (final dynamic actuator in actuators) {
+          final String? actuatorCode = actuator['actuator_code']?.toString();
+
+          final String? actualState = actuator['actual_state']?.toString();
+
+          final int? actuatorZoneId =
+              int.tryParse(actuator['zone_id']?.toString() ?? '');
+
+          if (actuatorZoneId != _selectedZoneId) {
+            continue;
+          }
+
+          if (actuatorCode == 'water_pump_01' ||
+              actuatorCode == 'water_pump_in_001') {
+            _waterPumpOn = actualState == 'on';
+          }
+
+          if (actuatorCode == 'oxygen_pump_01' ||
+              actuatorCode == 'water_pump_out_001') {
+            _waterPumpOutOn = actualState == 'on';
+          }
+        }
+      });
+    } catch (e) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _actuatorsLoading = false;
+        _actuatorsError = e.toString();
+      });
+    }
   }
 
   // ============================================================
@@ -175,7 +459,9 @@ class _DashboardViewState extends State<DashboardView> {
 
     final SseService sseService = SseService();
 
-    _sseSubscription = sseService.connectToRealtimeStream().listen(
+    _sseSubscription = sseService
+        .connectToRealtimeStream(zoneId: _selectedZoneId)
+        .listen(
       (Map<String, dynamic> data) {
         if (!mounted) {
           return;
@@ -191,6 +477,9 @@ class _DashboardViewState extends State<DashboardView> {
         setState(() {
           _sseConnected = false;
         });
+
+        debugPrint('SSE ERROR: $error');
+        _scheduleSseReconnect();
       },
       onDone: () {
         if (!mounted) {
@@ -200,9 +489,52 @@ class _DashboardViewState extends State<DashboardView> {
         setState(() {
           _sseConnected = false;
         });
+
+        debugPrint('SSE DONE: connection closed');
+        _scheduleSseReconnect();
       },
       cancelOnError: false,
     );
+  }
+
+  // ============================================================
+  // SSE RECONNECT SCHEDULER
+  // ============================================================
+
+  void _scheduleSseReconnect() {
+    if (!mounted) {
+      return;
+    }
+
+    if (_sseReconnectTimer != null) {
+      return;
+    }
+
+    _sseReconnectAttempt++;
+
+    final int delaySeconds = switch (_sseReconnectAttempt) {
+      1 => 2,
+      2 => 4,
+      3 => 8,
+      4 => 16,
+      _ => 30,
+    };
+
+    debugPrint(
+      'SSE RECONNECT: '
+      'attempt=$_sseReconnectAttempt '
+      'delay=${delaySeconds}s',
+    );
+
+    _sseReconnectTimer = Timer(Duration(seconds: delaySeconds), () async {
+      _sseReconnectTimer = null;
+
+      if (!mounted) {
+        return;
+      }
+
+      await _connectSse();
+    });
   }
 
   // ============================================================
@@ -210,6 +542,8 @@ class _DashboardViewState extends State<DashboardView> {
   // ============================================================
 
   void _handleSseData(Map<String, dynamic> data) {
+    debugPrint('DASHBOARD SSE DATA: $data');
+
     // ----------------------------------------------------------
     // SSE CONNECTION EVENT
     // ----------------------------------------------------------
@@ -221,7 +555,10 @@ class _DashboardViewState extends State<DashboardView> {
 
       setState(() {
         _sseConnected = true;
+        _sseReconnectAttempt = 0;
       });
+
+      debugPrint('SSE CONNECTED: reconnect attempt counter reset');
 
       return;
     }
@@ -249,6 +586,7 @@ class _DashboardViewState extends State<DashboardView> {
     final dynamic zoneIdValue = data['zone_id'];
     final dynamic sensorCodeValue = data['sensor_code'];
     final dynamic rawValue = data['value'];
+    final dynamic qualityValue = data['quality'];
 
     /// ต้องมีข้อมูลสำคัญครบ
     if (zoneIdValue == null || sensorCodeValue == null || rawValue == null) {
@@ -279,14 +617,8 @@ class _DashboardViewState extends State<DashboardView> {
     // SENSOR VALUE
     // ----------------------------------------------------------
 
-    /// Backend ส่ง value เป็น String เช่น:
-    ///
-    /// "31.5000"
-    ///
-    /// จึงต้อง parse เป็น double
     final double? value = double.tryParse(rawValue.toString());
 
-    /// ถ้าแปลงค่าไม่ได้ ไม่เปลี่ยน State
     if (value == null) {
       return;
     }
@@ -304,7 +636,19 @@ class _DashboardViewState extends State<DashboardView> {
 
       _sensorValuesByZone[zoneId]![sensorCode] = value;
 
+      _sensorQualityByZone.putIfAbsent(zoneId, () => <String, String>{});
+
+      _sensorQualityByZone[zoneId]![sensorCode] =
+          qualityValue?.toString() ?? 'unknown';
+
       _lastUpdate = DateTime.now();
+
+      debugPrint(
+        'DASHBOARD SENSOR STATE: '
+        'zone=$zoneId '
+        'sensor=$sensorCode '
+        'value=$value',
+      );
     });
   }
 
@@ -324,21 +668,36 @@ class _DashboardViewState extends State<DashboardView> {
     // ----------------------------------------------------------
     // ALL ZONES
     // ----------------------------------------------------------
-    //
-    // ถ้าเลือก All Zones:
-    // ค้นหาค่าจาก Zone ที่มีข้อมูล
-    //
-    // ถ้ามีหลาย Zone ที่ใช้ sensor_code เดียวกัน
-    // จะคืนค่าจาก Zone แรกที่มีข้อมูล
-    //
-    // PHASE 10.5 ยังไม่ได้ทำ aggregate
-    // ----------------------------------------------------------
 
     for (final Map<String, double> zoneSensors in _sensorValuesByZone.values) {
       final double? value = zoneSensors[sensorCode];
 
       if (value != null) {
         return value;
+      }
+    }
+
+    return null;
+  }
+
+  String? _getSensorQuality(String sensorCode) {
+    // ----------------------------------------------------------
+    // SELECTED ZONE
+    // ----------------------------------------------------------
+
+    if (_selectedZoneId != null) {
+      return _sensorQualityByZone[_selectedZoneId]?[sensorCode];
+    }
+
+    // ----------------------------------------------------------
+    // ALL ZONES
+    // ----------------------------------------------------------
+
+    for (final Map<String, String> zoneSensors in _sensorQualityByZone.values) {
+      final String? quality = zoneSensors[sensorCode];
+
+      if (quality != null) {
+        return quality;
       }
     }
 
@@ -382,41 +741,128 @@ class _DashboardViewState extends State<DashboardView> {
     return Scaffold(
       backgroundColor: const Color(0xFFF5F7FA),
       appBar: AppBar(
-        title: const Text(
-          'Smart Farm Dashboard',
-          style: TextStyle(fontWeight: FontWeight.bold),
-        ),
+        automaticallyImplyLeading: false,
         backgroundColor: Colors.green.shade700,
         foregroundColor: Colors.white,
         elevation: 0,
-        actions: [
-          IconButton(
-            tooltip: 'Refresh',
-            onPressed: () {
-              _loadZones();
-              _connectSse();
-            },
-            icon: const Icon(Icons.refresh),
-          ),
-          IconButton(
-            tooltip: 'Soil Test',
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (_) => const SoilTestScreen(),
+        toolbarHeight: 104,
+        titleSpacing: 0,
+        title: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              'Smart Farm',
+              style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 4),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                IconButton(
+                  tooltip: 'Refresh',
+                  onPressed: () {
+                    _loadZones();
+                    _loadActuators();
+                    _connectSse();
+                  },
+                  icon: const Icon(Icons.refresh),
                 ),
-              );
-            },
-            icon: const Icon(Icons.science),
-          ),
-          IconButton(
-            tooltip: 'Settings',
-            onPressed: () {},
-            icon: const Icon(Icons.settings),
-          ),
-          const SizedBox(width: 8),
-        ],
+                IconButton(
+                  tooltip: 'Zone Management',
+                  onPressed: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => const ZoneManagementScreen(),
+                      ),
+                    );
+                  },
+                  icon: const Icon(Icons.layers),
+                ),
+                IconButton(
+                  tooltip: 'Soil Test',
+                  onPressed: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (_) => const SoilTestScreen()),
+                    );
+                  },
+                  icon: const Icon(Icons.science),
+                ),
+                IconButton(
+                  tooltip: 'Actuator History',
+                  onPressed: _actuatorsLoading || _actuators.isEmpty
+                      ? null
+                      : () {
+                          showModalBottomSheet(
+                            context: context,
+                            builder: (context) {
+                              return SafeArea(
+                                child: ListView(
+                                  shrinkWrap: true,
+                                  children: _actuators.map<Widget>((actuator) {
+                                    final String actuatorCode =
+                                        actuator['actuator_code']?.toString() ??
+                                        '';
+
+                                    final String actuatorName =
+                                        actuator['name']?.toString() ??
+                                        actuatorCode;
+
+                                    return ListTile(
+                                      leading: const Icon(Icons.history),
+                                      title: Text(actuatorName),
+                                      subtitle: Text(actuatorCode),
+                                      onTap: () {
+                                        Navigator.pop(context);
+
+                                        Navigator.push(
+                                          context,
+                                          MaterialPageRoute(
+                                            builder: (_) =>
+                                                ActuatorHistoryScreen(
+                                                  actuatorId: actuatorCode,
+                                                  actuatorName: actuatorName,
+                                                ),
+                                          ),
+                                        );
+                                      },
+                                    );
+                                  }).toList(),
+                                ),
+                              );
+                            },
+                          );
+                        },
+                  icon: const Icon(Icons.history),
+                ),
+                IconButton(
+                  tooltip: 'Device & Sensor Management',
+                  onPressed: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => const DeviceSensorManagementScreen(),
+                      ),
+                    );
+                  },
+                  icon: const Icon(Icons.settings_input_component),
+                ),
+                IconButton(
+                  tooltip: 'Profile',
+                  onPressed: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (_) => const ProfileScreen()),
+                    );
+                  },
+                  icon: const Icon(Icons.account_circle),
+                ),
+              ],
+            ),
+          ],
+        ),
       ),
       body: SafeArea(
         child: LayoutBuilder(
@@ -538,7 +984,7 @@ class _DashboardViewState extends State<DashboardView> {
           ),
           const SizedBox(width: 8),
           Text(
-            _sseConnected ? 'Gateway Online' : 'Gateway Offline',
+            _sseConnected ? 'SSE Connected' : 'SSE Offline',
             style: TextStyle(fontWeight: FontWeight.w600, color: statusColor),
           ),
         ],
@@ -563,10 +1009,6 @@ class _DashboardViewState extends State<DashboardView> {
               style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 12),
-
-            // --------------------------------------------------
-            // LOADING
-            // --------------------------------------------------
             if (_zonesLoading)
               const SizedBox(
                 height: 42,
@@ -578,9 +1020,6 @@ class _DashboardViewState extends State<DashboardView> {
                   ),
                 ),
               )
-            // --------------------------------------------------
-            // ERROR
-            // --------------------------------------------------
             else if (_zonesError != null)
               Row(
                 children: [
@@ -595,25 +1034,14 @@ class _DashboardViewState extends State<DashboardView> {
                   TextButton(onPressed: _loadZones, child: const Text('Retry')),
                 ],
               )
-            // --------------------------------------------------
-            // ZONE LIST
-            // --------------------------------------------------
             else
               SizedBox(
                 height: 42,
                 child: ListView.separated(
                   scrollDirection: Axis.horizontal,
-
-                  /// +1 สำหรับ All Zones
                   itemCount: _zones.length + 1,
-
                   separatorBuilder: (_, _) => const SizedBox(width: 8),
-
                   itemBuilder: (context, index) {
-                    // ----------------------------------------
-                    // ALL ZONES
-                    // ----------------------------------------
-
                     if (index == 0) {
                       final bool selected = _selectedZoneId == null;
 
@@ -632,10 +1060,6 @@ class _DashboardViewState extends State<DashboardView> {
                         ),
                       );
                     }
-
-                    // ----------------------------------------
-                    // API ZONE
-                    // ----------------------------------------
 
                     final dynamic zone = _zones[index - 1];
 
@@ -657,6 +1081,8 @@ class _DashboardViewState extends State<DashboardView> {
                         setState(() {
                           _selectedZoneId = zoneId;
                         });
+
+                        _connectSse();
                       },
                       selectedColor: Colors.green.shade600,
                       labelStyle: TextStyle(
@@ -667,10 +1093,6 @@ class _DashboardViewState extends State<DashboardView> {
                   },
                 ),
               ),
-
-            // --------------------------------------------------
-            // SELECTED ZONE INFORMATION
-            // --------------------------------------------------
             if (!_zonesLoading &&
                 _zonesError == null &&
                 _selectedZoneId != null) ...[
@@ -678,6 +1100,21 @@ class _DashboardViewState extends State<DashboardView> {
               Text(
                 _getSelectedZoneDescription(),
                 style: const TextStyle(fontSize: 12, color: Colors.grey),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                'ESP32 / Sensor Status: ${_getSelectedZoneSensorStatus()}',
+                style: const TextStyle(fontSize: 12),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                'SSE Endpoint: ${SseService().url}',
+                style: const TextStyle(fontSize: 12),
+              ),
+              const SizedBox(height: 4),
+              const Text(
+                'Gateway Status: Not Reported',
+                style: TextStyle(fontSize: 12),
               ),
             ],
           ],
@@ -689,6 +1126,62 @@ class _DashboardViewState extends State<DashboardView> {
   // ============================================================
   // SELECTED ZONE DESCRIPTION
   // ============================================================
+
+  List<dynamic> _getSelectedZoneSensors() {
+    if (_selectedZoneId == null) {
+      return [];
+    }
+
+    return _sensors.where((sensor) {
+      final dynamic zoneId = sensor['zone_id'];
+      return zoneId != null &&
+          int.tryParse(zoneId.toString()) == _selectedZoneId;
+    }).toList();
+  }
+
+  String _getSelectedZoneSensorStatus() {
+    final List<dynamic> sensors = _getSelectedZoneSensors();
+
+    if (_sensorsLoading) {
+      return 'Loading';
+    }
+
+    if (sensors.isEmpty) {
+      return 'Offline / No Data';
+    }
+
+    final DateTime now = DateTime.now();
+
+    for (final dynamic sensor in sensors) {
+      final String? lastReadingText =
+          sensor['last_reading_at']?.toString();
+
+      if (lastReadingText == null || lastReadingText.isEmpty) {
+        return 'Offline / No Data';
+      }
+
+      final DateTime? lastReading =
+          DateTime.tryParse(lastReadingText.replaceFirst(' ', 'T'));
+
+      if (lastReading == null) {
+        return 'Offline / No Data';
+      }
+
+      final int samplingInterval =
+          int.tryParse(
+                sensor['sampling_interval_seconds']?.toString() ?? '',
+              ) ??
+              60;
+
+      final int allowedAge = samplingInterval * 3;
+
+      if (now.difference(lastReading).inSeconds > allowedAge) {
+        return 'Offline';
+      }
+    }
+
+    return 'Online';
+  }
 
   String _getSelectedZoneDescription() {
     if (_selectedZoneId == null) {
@@ -759,6 +1252,64 @@ class _DashboardViewState extends State<DashboardView> {
     );
   }
 
+  Future<void> _loadLatestSoilTests() async {
+    final Map<int, dynamic> latestByZone = {};
+
+    for (final zone in _zones) {
+      final int? zoneId = int.tryParse(zone['id'].toString());
+
+      if (zoneId == null) {
+        continue;
+      }
+
+      try {
+        final List<dynamic> history = await ApiService.getSoilTestHistory(
+          zoneId,
+        );
+
+        if (history.isNotEmpty) {
+          latestByZone[zoneId] = history.first;
+        }
+      } catch (_) {
+        // Keep dashboard usable if soil-test history is unavailable.
+      }
+    }
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _latestSoilTestByZone = latestByZone;
+    });
+  }
+
+  // ============================================================
+  // DASHBOARD SENSOR CODE
+  // ============================================================
+
+  String _getDashboardSensorCode(String sensorType) {
+    final int? zoneId = _selectedZoneId;
+
+    if (zoneId == null) {
+      return '${sensorType}_01';
+    }
+
+    for (final dynamic zone in _zones) {
+      if (_getZoneId(zone) == zoneId) {
+        final String zoneCode = zone['code']?.toString() ?? '';
+
+        if (zoneCode == 'zone_03') {
+          return '${sensorType}_001';
+        }
+
+        break;
+      }
+    }
+
+    return '${sensorType}_01';
+  }
+
   // ============================================================
   // DASHBOARD GRID
   // ============================================================
@@ -776,33 +1327,93 @@ class _DashboardViewState extends State<DashboardView> {
       crossAxisCount = 1;
     }
 
-    // ----------------------------------------------------------
-    // GET CURRENT ZONE SENSOR VALUES
-    // ----------------------------------------------------------
+    final String temperatureSensorCode =
+        _getDashboardSensorCode('temperature');
 
-    final double? temperature = _getSensorValue('temperature_01');
+    final String humiditySensorCode =
+        _getDashboardSensorCode('humidity');
 
-    final double? humidity = _getSensorValue('humidity_01');
+    final String soilMoistureSensorCode =
+        _getDashboardSensorCode('soil_moisture');
 
-    final double? soilMoisture = _getSensorValue('soil_moisture_01');
+    final double? temperature =
+        _getSensorValue(temperatureSensorCode);
+
+    final double? humidity =
+        _getSensorValue(humiditySensorCode);
+
+    final double? soilMoisture =
+        _getSensorValue(soilMoistureSensorCode);
+
+    final String? temperatureQuality =
+        _getSensorQuality(temperatureSensorCode);
+
+    final String? humidityQuality =
+        _getSensorQuality(humiditySensorCode);
+
+    final String? soilMoistureQuality =
+        _getSensorQuality(soilMoistureSensorCode);
+
+    final double? vpd = _calculateVpd(temperature, humidity);
+
+    final AiSafetyResult aiSafety = _evaluateAiSafety(
+      temperature: temperature,
+      humidity: humidity,
+      soilMoisture: soilMoisture,
+      temperatureQuality: temperatureQuality,
+      humidityQuality: humidityQuality,
+      soilMoistureQuality: soilMoistureQuality,
+    );
 
     final dynamic latestSoilTest = _selectedZoneId != null
         ? _latestSoilTestByZone[_selectedZoneId]
         : (_latestSoilTestByZone.values.isNotEmpty
-            ? _latestSoilTestByZone.values.reduce((a, b) {
-                final DateTime dateA =
-                    DateTime.tryParse(
-                          a['measured_at']?.toString() ?? '',
-                        ) ??
-                        DateTime.fromMillisecondsSinceEpoch(0);
-                final DateTime dateB =
-                    DateTime.tryParse(
-                          b['measured_at']?.toString() ?? '',
-                        ) ??
-                        DateTime.fromMillisecondsSinceEpoch(0);
-                return dateA.isAfter(dateB) ? a : b;
-              })
-            : null);
+              ? _latestSoilTestByZone.values.reduce((a, b) {
+                  final DateTime dateA =
+                      DateTime.tryParse(a['measured_at']?.toString() ?? '') ??
+                      DateTime.fromMillisecondsSinceEpoch(0);
+
+                  final DateTime dateB =
+                      DateTime.tryParse(b['measured_at']?.toString() ?? '') ??
+                      DateTime.fromMillisecondsSinceEpoch(0);
+
+                  return dateA.isAfter(dateB) ? a : b;
+                })
+              : null);
+
+    debugPrint(
+      'AI CONTEXT => '
+      'zone=$_selectedZoneId, '
+      'temperature=$temperature, '
+      'humidity=$humidity, '
+      'soilMoisture=$soilMoisture, '
+      'vpd=$vpd, '
+      'soilTest=$latestSoilTest',
+    );
+
+    final String aiDecision = aiSafety.allowed
+        ? _getLocalAiDecision(
+            temperature: temperature,
+            humidity: humidity,
+            soilMoisture: soilMoisture,
+            vpd: vpd,
+            soilTest: latestSoilTest,
+          )
+        : 'AI Recommendation ถูกระงับชั่วคราว\n'
+              'เหตุผล: ${aiSafety.reason}';
+
+    final String aiStatus = aiSafety.allowed
+        ? _getLocalAiStatus(
+            temperature: temperature,
+            humidity: humidity,
+            soilMoisture: soilMoisture,
+            vpd: vpd,
+            soilTest: latestSoilTest,
+          )
+        : 'Safety Blocked';
+
+    final bool actuatorsReady =
+        !_actuatorsLoading && _actuatorsError == null && _actuators.isNotEmpty;
 
     final List<Widget> cards = [
       // --------------------------------------------------------
@@ -842,18 +1453,61 @@ class _DashboardViewState extends State<DashboardView> {
       // --------------------------------------------------------
       // VPD
       // --------------------------------------------------------
-      // ยังไม่คำนวณ VPD ใน PHASE 10.5
-      // --------------------------------------------------------
       _buildSensorCard(
         title: 'VPD',
-        value: '--',
+        value: _formatSensorValue(vpd),
         unit: 'kPa',
         icon: Icons.air,
-        status: 'Pending',
+        status: vpd != null ? 'Calculated' : 'Waiting',
       ),
+      Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(20),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(
+            color: Theme.of(context).colorScheme.outline.withValues(alpha: 0.2),
+          ),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(
+              Icons.psychology,
+              size: 32,
+              color: _getAiStatusColor(aiStatus),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'AI Recommendation',
+                    style: Theme.of(context).textTheme.titleMedium
+                        ?.copyWith(fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    aiDecision,
+                    style: Theme.of(context).textTheme.bodyMedium,
+                  ),
+                  const SizedBox(height: 8),
 
+                  Text(
+                    'สถานะ: $aiStatus',
+                    style: Theme.of(context).textTheme.titleSmall
+                        ?.copyWith(fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 6),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
       // --------------------------------------------------------
-      // pH — LATEST SOIL TEST
+      // pH
       // --------------------------------------------------------
       _buildSensorCard(
         title: 'pH',
@@ -864,16 +1518,16 @@ class _DashboardViewState extends State<DashboardView> {
       ),
 
       // --------------------------------------------------------
-      // NPK — LATEST SOIL TEST
+      // NPK
       // --------------------------------------------------------
       _buildSensorCard(
         title: 'NPK',
         value: latestSoilTest != null
-            ? 'N ${latestSoilTest['nitrogen'] ?? '-'} | '
-                'P ${latestSoilTest['phosphorus'] ?? '-'} | '
-                'K ${latestSoilTest['potassium'] ?? '-'}'
+            ? 'N: ${latestSoilTest['nitrogen'] ?? '--'} mg/kg\n'
+                  'P: ${latestSoilTest['phosphorus'] ?? '--'} mg/kg\n'
+                  'K: ${latestSoilTest['potassium'] ?? '--'} mg/kg'
             : '--',
-        unit: 'mg/kg',
+        unit: '',
         icon: Icons.eco,
         status: latestSoilTest != null ? 'Latest' : 'Pending',
       ),
@@ -881,25 +1535,33 @@ class _DashboardViewState extends State<DashboardView> {
       // --------------------------------------------------------
       // WATER PUMP
       // --------------------------------------------------------
-      // Actuator ยังเป็น UI simulation
-      // --------------------------------------------------------
       _buildActuatorCard(
-        title: 'Water Pump',
-        subtitle: 'Main irrigation pump',
+        title: 'Water Pump In',
+        subtitle: actuatorsReady
+            ? 'Main irrigation pump'
+            : _actuatorsLoading
+            ? 'Loading actuator...'
+            : 'Actuator unavailable',
         icon: Icons.water,
-        isOn: false,
+        isOn: _waterPumpOn,
+        onChanged: actuatorsReady ? _setWaterPump : null,
+        loading: _waterPumpCommandLoading || _actuatorsLoading,
       ),
 
       // --------------------------------------------------------
       // OXYGEN PUMP
       // --------------------------------------------------------
-      // Actuator ยังเป็น UI simulation
-      // --------------------------------------------------------
       _buildActuatorCard(
-        title: 'Oxygen Pump',
-        subtitle: 'Fish pond oxygen',
+        title: 'Water Pump Out',
+        subtitle: actuatorsReady
+            ? 'Fish pond oxygen'
+            : _actuatorsLoading
+            ? 'Loading actuator...'
+            : 'Actuator unavailable',
         icon: Icons.bubble_chart,
-        isOn: true,
+        isOn: _waterPumpOutOn,
+        onChanged: actuatorsReady ? _setWaterPumpOut : null,
+        loading: _waterPumpOutCommandLoading || _actuatorsLoading,
       ),
     ];
 
@@ -913,7 +1575,7 @@ class _DashboardViewState extends State<DashboardView> {
           crossAxisCount: crossAxisCount,
           crossAxisSpacing: 16,
           mainAxisSpacing: 16,
-          mainAxisExtent: 190,
+          mainAxisExtent: 220,
         ),
         itemBuilder: (context, index) {
           return cards[index];
@@ -937,6 +1599,200 @@ class _DashboardViewState extends State<DashboardView> {
   // ============================================================
   // SENSOR CARD
   // ============================================================
+
+  double? _calculateVpd(double? temperature, double? humidity) {
+    if (temperature == null || humidity == null) {
+      return null;
+    }
+
+    if (humidity < 0 || humidity > 100) {
+      return null;
+    }
+
+    final double saturationVaporPressure =
+        0.6108 * math.exp((17.27 * temperature) / (temperature + 237.3));
+
+    final double vpd = saturationVaporPressure * (1 - humidity / 100);
+
+    return vpd;
+  }
+
+  AiSafetyResult _evaluateAiSafety({
+    required double? temperature,
+    required double? humidity,
+    required double? soilMoisture,
+    required String? temperatureQuality,
+    required String? humidityQuality,
+    required String? soilMoistureQuality,
+  }) {
+    if (temperature == null) {
+      return const AiSafetyResult(
+        allowed: false,
+        reason: 'ข้อมูล Temperature ยังไม่พร้อม',
+      );
+    }
+
+    if (humidity == null) {
+      return const AiSafetyResult(
+        allowed: false,
+        reason: 'ข้อมูล Humidity ยังไม่พร้อม',
+      );
+    }
+
+    if (soilMoisture == null) {
+      return const AiSafetyResult(
+        allowed: false,
+        reason: 'ข้อมูล Soil Moisture ยังไม่พร้อม',
+      );
+    }
+
+    if (temperatureQuality != 'valid') {
+      return AiSafetyResult(
+        allowed: false,
+        reason:
+            'Temperature มีคุณภาพข้อมูลไม่พร้อมใช้งาน '
+            '(quality: ${temperatureQuality ?? 'unknown'})',
+      );
+    }
+
+    if (humidityQuality != 'valid') {
+      return AiSafetyResult(
+        allowed: false,
+        reason:
+            'Humidity มีคุณภาพข้อมูลไม่พร้อมใช้งาน '
+            '(quality: ${humidityQuality ?? 'unknown'})',
+      );
+    }
+
+    if (soilMoistureQuality != 'valid') {
+      return AiSafetyResult(
+        allowed: false,
+        reason:
+            'Soil Moisture มีคุณภาพข้อมูลไม่พร้อมใช้งาน '
+            '(quality: ${soilMoistureQuality ?? 'unknown'})',
+      );
+    }
+
+    return const AiSafetyResult(
+      allowed: true,
+      reason: 'ข้อมูล Sensor ผ่าน Safety Validation',
+    );
+  }
+
+  String _getLocalAiDecision({
+    required double? temperature,
+    required double? humidity,
+    required double? soilMoisture,
+    required double? vpd,
+    dynamic soilTest,
+  }) {
+    if (temperature == null ||
+        humidity == null ||
+        soilMoisture == null ||
+        vpd == null) {
+      return 'กำลังรอข้อมูลจากเซนเซอร์';
+    }
+
+    String decision;
+
+    if (soilMoisture < 25 && vpd >= 1.5) {
+      decision = 'ดินค่อนข้างแห้งและ VPD สูง ควรพิจารณาให้น้ำแก่พืช';
+    } else if (soilMoisture < 25) {
+      decision = 'ความชื้นในดินต่ำ ควรพิจารณาให้น้ำแก่พืช';
+    } else if (vpd >= 2.0) {
+      decision =
+          'VPD สูง พืชอาจมีความต้องการน้ำเพิ่มขึ้น '
+          'ควรติดตามอย่างใกล้ชิด';
+    } else if (vpd >= 1.2) {
+      decision =
+          'VPD อยู่ในระดับปานกลาง '
+          'ควรติดตามสภาพแวดล้อมของพืชต่อเนื่อง';
+    } else if (soilMoisture > 80) {
+      decision =
+          'ความชื้นในดินสูง '
+          'ควรหลีกเลี่ยงการให้น้ำโดยไม่จำเป็น';
+    } else {
+      decision = 'สภาพแวดล้อมโดยรวมอยู่ในเกณฑ์ค่อนข้างปกติ';
+    }
+
+    if (soilTest != null) {
+      final String ph = soilTest['ph']?.toString() ?? '-';
+      final String nitrogen = soilTest['nitrogen']?.toString() ?? '-';
+      final String phosphorus = soilTest['phosphorus']?.toString() ?? '-';
+      final String potassium = soilTest['potassium']?.toString() ?? '-';
+
+      decision +=
+          '\n\nผลตรวจดินล่าสุด: '
+          'pH $ph, N $nitrogen, P $phosphorus, '
+          'K $potassium mg/kg';
+    }
+
+    return decision;
+  }
+
+  String _getLocalAiStatus({
+    required double? temperature,
+    required double? humidity,
+    required double? soilMoisture,
+    required double? vpd,
+    dynamic soilTest,
+  }) {
+    if (temperature == null ||
+        humidity == null ||
+        soilMoisture == null ||
+        vpd == null) {
+      return 'กำลังรอข้อมูล';
+    }
+
+    if (soilMoisture < 25 && vpd >= 2.0) {
+      return 'ความเสี่ยงขาดน้ำสูง';
+    }
+
+    if (soilMoisture < 25 && vpd >= 1.5) {
+      return 'ควรพิจารณาให้น้ำ';
+    }
+
+    if (soilMoisture < 25) {
+      return 'ควรพิจารณาให้น้ำ';
+    }
+
+    if (vpd >= 2.0) {
+      return 'ควรติดตาม';
+    }
+
+    if (vpd >= 1.2) {
+      return 'ควรติดตาม';
+    }
+
+    if (soilMoisture > 80) {
+      return 'ควรติดตาม';
+    }
+
+    if (soilTest != null) {
+      return 'ปกติ (มีข้อมูลดินล่าสุด)';
+    }
+
+    return 'ปกติ';
+  }
+
+  Color _getAiStatusColor(String status) {
+    switch (status) {
+      case 'ปกติ':
+        return Colors.green;
+
+      case 'ควรติดตาม':
+        return Colors.amber;
+
+      case 'ควรพิจารณาให้น้ำ':
+        return Colors.orange;
+
+      case 'ความเสี่ยงขาดน้ำสูง':
+        return Colors.red;
+
+      default:
+        return Colors.grey;
+    }
+  }
 
   Widget _buildSensorCard({
     required String title,
@@ -994,34 +1850,50 @@ class _DashboardViewState extends State<DashboardView> {
                 ),
               ],
             ),
-            const Spacer(),
+            if (value.contains('\n'))
+              const SizedBox(height: 12)
+            else
+              const Spacer(),
             Text(
               title,
               style: const TextStyle(color: Colors.grey, fontSize: 14),
             ),
             const SizedBox(height: 4),
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.end,
-              children: [
-                Text(
-                  value,
-                  style: const TextStyle(
-                    fontSize: 30,
-                    fontWeight: FontWeight.bold,
-                  ),
+            if (value.contains('\n'))
+              Text(
+                value,
+                style: const TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                  height: 1.25,
                 ),
-                if (unit.isNotEmpty) ...[
-                  const SizedBox(width: 5),
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 4),
-                    child: Text(
-                      unit,
-                      style: const TextStyle(color: Colors.grey, fontSize: 14),
+              )
+            else
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Text(
+                    value,
+                    style: const TextStyle(
+                      fontSize: 30,
+                      fontWeight: FontWeight.bold,
                     ),
                   ),
+                  if (unit.isNotEmpty) ...[
+                    const SizedBox(width: 5),
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 4),
+                      child: Text(
+                        unit,
+                        style: const TextStyle(
+                          color: Colors.grey,
+                          fontSize: 14,
+                        ),
+                      ),
+                    ),
+                  ],
                 ],
-              ],
-            ),
+              ),
           ],
         ),
       ),
@@ -1037,6 +1909,8 @@ class _DashboardViewState extends State<DashboardView> {
     required String subtitle,
     required IconData icon,
     required bool isOn,
+    ValueChanged<bool>? onChanged,
+    bool loading = false,
   }) {
     return Card(
       elevation: 1,
@@ -1060,14 +1934,14 @@ class _DashboardViewState extends State<DashboardView> {
                   ),
                 ),
                 const Spacer(),
-                Switch(
-                  value: isOn,
-                  onChanged: (value) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text('$title ${value ? "ON" : "OFF"}')),
-                    );
-                  },
-                ),
+                if (loading)
+                  const SizedBox(
+                    width: 24,
+                    height: 24,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                else
+                  Switch(value: isOn, onChanged: onChanged),
               ],
             ),
             const Spacer(),

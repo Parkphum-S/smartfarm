@@ -59,6 +59,7 @@ class _LoginViewState extends State<LoginView> {
       await AuthService.login(
         username: _usernameController.text.trim(),
         password: _passwordController.text,
+        rememberMe: _rememberMe,
       );
 
       debugPrint(

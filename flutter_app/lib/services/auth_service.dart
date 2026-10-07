@@ -2,11 +2,15 @@ import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../config/app_config.dart';
 
 class AuthService {
   AuthService._();
+
+  static const String _savedTokenKey =
+      'smartfarm_auth_token';
 
   static String? _token;
   static Map<String, dynamic>? _currentUser;
@@ -32,6 +36,7 @@ class AuthService {
   static Future<Map<String, dynamic>> login({
     required String username,
     required String password,
+    bool rememberMe = false,
   }) async {
     final uri = Uri.parse(
       '${AppConfig.apiBaseUrl}/auth/login.php',
@@ -95,6 +100,30 @@ class AuthService {
 
         // เก็บ Token ไว้ใน memory
         _token = token;
+
+        // Remember Me:
+        // เก็บเฉพาะ authentication token
+        // ไม่เก็บ password ลงเครื่อง
+        final prefs = await SharedPreferences.getInstance();
+
+        if (rememberMe) {
+          await prefs.setString(
+            _savedTokenKey,
+            token,
+          );
+
+          debugPrint(
+            'LOGIN: session persisted',
+          );
+        } else {
+          await prefs.remove(
+            _savedTokenKey,
+          );
+
+          debugPrint(
+            'LOGIN: persistent session disabled',
+          );
+        }
 
         debugPrint(
           'LOGIN: token received successfully',
@@ -232,6 +261,69 @@ class AuthService {
   }
 
   // ============================================================
+  // RESTORE SESSION
+  // ============================================================
+
+  static Future<bool> restoreSession() async {
+    debugPrint(
+      'AUTH RESTORE: checking saved session',
+    );
+
+    try {
+      final prefs =
+          await SharedPreferences.getInstance();
+
+      final savedToken =
+          prefs.getString(_savedTokenKey);
+
+      if (savedToken == null ||
+          savedToken.isEmpty) {
+        debugPrint(
+          'AUTH RESTORE: no saved session',
+        );
+
+        return false;
+      }
+
+      _token = savedToken;
+
+      debugPrint(
+        'AUTH RESTORE: saved token found',
+      );
+
+      try {
+        await getCurrentUser();
+
+        debugPrint(
+          'AUTH RESTORE: session valid',
+        );
+
+        return true;
+      } catch (e) {
+        debugPrint(
+          'AUTH RESTORE: session invalid',
+        );
+
+        await prefs.remove(
+          _savedTokenKey,
+        );
+
+        _clearLocalSession();
+
+        return false;
+      }
+    } catch (e) {
+      debugPrint(
+        'AUTH RESTORE: exception=$e',
+      );
+
+      _clearLocalSession();
+
+      return false;
+    }
+  }
+
+  // ============================================================
   // CURRENT USER
   // ============================================================
 
@@ -295,6 +387,7 @@ class AuthService {
           'AUTH ME: session invalid or expired',
         );
 
+        await _clearPersistedSession();
         _clearLocalSession();
 
         throw Exception(
@@ -328,6 +421,7 @@ class AuthService {
         'LOGOUT: no active session',
       );
 
+      await _clearPersistedSession();
       _clearLocalSession();
       return;
     }
@@ -357,6 +451,7 @@ class AuthService {
       // ฝั่ง App ต้องล้าง token
       if (response.statusCode >= 200 &&
           response.statusCode < 500) {
+        await _clearPersistedSession();
         _clearLocalSession();
 
         debugPrint(
@@ -366,6 +461,7 @@ class AuthService {
         return;
       }
 
+      await _clearPersistedSession();
       _clearLocalSession();
     } catch (e) {
       debugPrint(
@@ -374,6 +470,7 @@ class AuthService {
 
       // Network error:
       // ล้าง session ฝั่ง App เพื่อความปลอดภัย
+      await _clearPersistedSession();
       _clearLocalSession();
     }
   }
@@ -384,6 +481,19 @@ class AuthService {
 
   static void clearSession() {
     _clearLocalSession();
+  }
+
+  static Future<void> _clearPersistedSession() async {
+    final prefs =
+        await SharedPreferences.getInstance();
+
+    await prefs.remove(
+      _savedTokenKey,
+    );
+
+    debugPrint(
+      'AUTH: persistent session cleared',
+    );
   }
 
   static void _clearLocalSession() {

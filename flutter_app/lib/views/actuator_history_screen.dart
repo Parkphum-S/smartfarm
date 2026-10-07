@@ -19,8 +19,8 @@ class ActuatorHistoryScreen extends StatefulWidget {
 
 class _ActuatorHistoryScreenState extends State<ActuatorHistoryScreen> {
   static const List<Map<String, String>> _availableActuators = [
-    {'id': 'water_pump_01', 'name': 'Water Pump'},
-    {'id': 'oxygen_pump_01', 'name': 'Oxygen Pump'},
+    {'id': 'water_pump_01', 'name': 'Water Pump In'},
+    {'id': 'oxygen_pump_01', 'name': 'Water Pump Out'},
   ];
 
   late String _selectedActuatorId;
